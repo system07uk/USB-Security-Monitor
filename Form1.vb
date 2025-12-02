@@ -1,271 +1,359 @@
 ﻿Imports System.Management
 Imports System.Timers
-
 Imports System.Drawing.Imaging
 Imports System.IO
 Imports System.Net
-Imports System.Net.Mail
 Imports Emgu.CV
-
 Imports Emgu.CV.BitmapExtension
-
-Imports System.Windows.Forms.VisualStyles.VisualStyleElement
+Imports System.Windows.Forms
+Imports System.Net.Http
+Imports Newtonsoft.Json
+Imports System.Text
+Imports System.Threading.Tasks
+Imports System.Linq
+Imports System.Diagnostics
 
 Public Class Form1
-    Private WithEvents shutdownTimer As New Timer(5000) ' 5초 타이머
+    ' Modified: Support for %APPDATA%
+    Private ReadOnly CONFIG_PATH As String = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "HUK_CHK.NFO")
+    Private Const FORMAT_ARGS As String = "/FS:NTFS /Q /Y"
+    Private Const DISCORD_COLOR_WARNING As Integer = 16711680 ' Red: For changes
+    Private Const DISCORD_COLOR_NORMAL As Integer = 65280 ' Green: For normal
+    Private WithEvents ShutdownTimer As New System.Timers.Timer(5000)
     Private shutdownInitiated As Boolean = False
-    Private WithEvents watcher As ManagementEventWatcher
-
-    Dim emailCredentials
-    Dim emailAddress As String, emailPassword As String
-    Dim sHostName As String, sUserName As String
-
+    Private WithEvents Watcher As ManagementEventWatcher
+    Dim normalPassword As String, emergencyPassword As String
+    Dim webhookUrl As String
     Private lastTaskbarTitles As New List(Of String)
-    Private newTitles As New List(Of String)
-    Private removedTitles As New List(Of String)
     Public header As String
-
     Private cam_capture As VideoCapture
     Private webcamImage As Bitmap
 
     Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
-        ' 이메일 주소와 패스워드 읽기
-        emailCredentials = ReadEmailCredentials("HUK_CHK.NFO")
-        emailAddress = emailCredentials.Item1
-        emailPassword = emailCredentials.Item2
-
-        shutdownTimer.Start()
-
+        Dim credentials = ReadCredentials(CONFIG_PATH)
+        normalPassword = credentials.Item1
+        emergencyPassword = credentials.Item2
+        webhookUrl = credentials.Item3
+        If String.IsNullOrEmpty(normalPassword) AndAlso String.IsNullOrEmpty(emergencyPassword) AndAlso String.IsNullOrEmpty(webhookUrl) Then
+            ' No file or empty data: Show settings dialog
+            Button_config_Click(Nothing, EventArgs.Empty)
+        End If
+        ShutdownTimer.Start()
         Dim query As New WqlEventQuery("SELECT * FROM Win32_VolumeChangeEvent WHERE EventType = 2")
-        watcher = New ManagementEventWatcher(query)
-        AddHandler watcher.EventArrived, AddressOf USBInserted
-        watcher.Start()
+        Watcher = New ManagementEventWatcher(query)
+        AddHandler Watcher.EventArrived, AddressOf USBInserted
+        Watcher.Start()
     End Sub
 
-    Private Sub shutdownTimer_Elapsed(sender As Object, e As ElapsedEventArgs) Handles shutdownTimer.Elapsed
-        shutdownTimer.Stop()
-        Process.Start("shutdown", "/s /t 120") ' 시스템을 2분 후 종료 명령
+    Private Sub ShutdownTimer_Elapsed(sender As Object, e As ElapsedEventArgs) Handles ShutdownTimer.Elapsed
+        ShutdownTimer.Stop()
+        If Me.InvokeRequired Then Me.Invoke(Sub() ShowPasswordDialog()) Else ShowPasswordDialog()
+    End Sub
 
-        InitializeWebcam() ' 웹캠을 먼저 실행
-        ProcessFrame() '웹캠 캡쳐
-        sendemail_webcam() ' 이메일 전송
-
-        Dim password As String = InputBox("암호를 입력하세요:", "암호 확인")
-
-        If password <> "0000" Then
-            MessageBox.Show("허가 받지 않은 사용자입니다. 시스템을 종료합니다.")
+    Private Async Sub ShowPasswordDialog()
+        Dim password = ShowPasswordInputBox("Enter password:", "Password Verification", 60)
+        If String.IsNullOrEmpty(password) OrElse password <> normalPassword Then
+            Await Task.Run(Sub() Me.Invoke(Sub() MessageBox.Show("Unauthorized user. Shutting down the system.")))
             shutdownInitiated = True
-            ' 비상암호 입력 부분 실행
-            Dim emergencyPassword As String = InputBox("===비상암호를 입력하세요===", "비상암호 확인")
-            If emergencyPassword = "1234" Then
+            InitiateShutdown(120)
+            CaptureAndSendEmail()
+            Dim emergencyInput = ShowPasswordInputBox("===Enter emergency password===", "Emergency Password Verification", 60)
+            If emergencyInput = emergencyPassword Then
                 shutdownInitiated = False
-                Process.Start("shutdown", "/a") ' 시스템 종료 취소 명령
-                MessageBox.Show("시스템 종료가 취소되었습니다.")
+                InitiateShutdown(0, True)
+                MessageBox.Show("System shutdown canceled.")
             End If
         Else
             shutdownInitiated = False
-            Process.Start("shutdown", "/a") ' 시스템 종료 취소 명령
-            MessageBox.Show("시스템 정상")
+            MessageBox.Show("System normal")
         End If
+    End Sub
+
+    Private Function ShowPasswordInputBox(prompt As String, title As String, Optional timeoutSeconds As Integer = 60) As String
+        Dim inputForm As New Form With {
+            .Width = 400, .Height = 180, .Text = title, .FormBorderStyle = FormBorderStyle.FixedDialog,
+            .StartPosition = FormStartPosition.CenterScreen, .MinimizeBox = False, .MaximizeBox = False
+        }
+        Dim label As New Label With {.Left = 10, .Top = 20, .Text = prompt, .AutoSize = True}
+        Dim textBox As New TextBox With {.Left = 10, .Top = 50, .Width = 360, .PasswordChar = "*"c}
+        Dim okButton As New Button With {.Text = "OK", .Left = 210, .Top = 100, .DialogResult = DialogResult.OK}
+        Dim cancelButton As New Button With {.Text = "Cancel", .Left = 290, .Top = 100, .DialogResult = DialogResult.Cancel}
+        Dim countdownLabel As New Label With {.Left = 10, .Top = 130, .AutoSize = True}
+        inputForm.Controls.AddRange({label, textBox, okButton, cancelButton, countdownLabel})
+        inputForm.AcceptButton = okButton
+        inputForm.CancelButton = cancelButton
+        Dim remainingTime = timeoutSeconds
+        Dim countdownTimer As New System.Windows.Forms.Timer With {.Interval = 1000}
+        AddHandler countdownTimer.Tick, Sub()
+                                            remainingTime -= 1
+                                            If remainingTime <= 0 Then
+                                                countdownTimer.Stop()
+                                                inputForm.DialogResult = DialogResult.Cancel
+                                                inputForm.Close()
+                                            Else
+                                                countdownLabel.Text = $"Remaining time: {remainingTime} seconds"
+                                            End If
+                                        End Sub
+        countdownTimer.Start()
+        Dim result = If(inputForm.ShowDialog() = DialogResult.OK, textBox.Text, String.Empty)
+        countdownTimer.Stop()
+        Return result
+    End Function
+
+    Private Function ReadCredentials(filePath As String) As Tuple(Of String, String, String)
+        Try
+            Dim lines = File.ReadAllLines(filePath)
+            If lines.Length >= 3 Then
+                Return Tuple.Create(lines(0), lines(1), lines(2))
+            Else
+                Throw New Exception("Insufficient data in file.")
+            End If
+        Catch ex As Exception
+            MessageBox.Show("No config file, proceeding to password setup.")
+            ShowConfigDialog()
+            Return Tuple.Create(String.Empty, String.Empty, String.Empty)
+        End Try
+    End Function
+
+    Private Sub CaptureAndSendEmail()
+        Try
+            InitializeWebcam()
+            ProcessFrame()
+            Dim myip = IPtest()
+            header = $"Event rec: {myip}: {Environ$("computername")}: {Environ$("username")}"
+            InitializeTaskbarMonitoring()
+            SendToDiscord(lastTaskbarTitles, New List(Of String), lastTaskbarTitles)
+        Catch ex As Exception
+            MessageBox.Show("An error occurred: " & ex.Message)
+        Finally
+            ReleaseWebcam()
+        End Try
     End Sub
 
     Private Sub InitializeWebcam()
         Try
             cam_capture = New VideoCapture()
             If cam_capture Is Nothing OrElse cam_capture.Ptr = IntPtr.Zero Then
-                'MessageBox.Show("웹캠 초기화 실패")
+                If Check_cam IsNot Nothing Then Check_cam.Checked = False
                 Return
             End If
-            AddHandler Application.Idle, AddressOf ProcessFrame
-            SetCheckCamChecked(True)
-            'MessageBox.Show("웹캠 초기화 성공")
+            If Check_cam IsNot Nothing Then Check_cam.Checked = True
         Catch ex As Exception
-            'MessageBox.Show("웹캠 초기화 중 오류가 발생했습니다: " & ex.Message)
+            If Check_cam IsNot Nothing Then Check_cam.Checked = False
         End Try
     End Sub
 
+    Private Sub ReleaseWebcam()
+        cam_capture?.Dispose()
+        cam_capture = Nothing
+    End Sub
 
     Private Sub USBInserted(sender As Object, e As EventArrivedEventArgs)
-        Dim driveLetter As String = e.NewEvent.Properties("DriveName").Value.ToString()
-        FormatDrive(driveLetter)
-        MessageBox.Show("허가받지 않은 장치가 연결되어 제거하였습니다: " & driveLetter)
+        Dim driveLetter = e.NewEvent.Properties("DriveName").Value.ToString()
+        If Check_usb IsNot Nothing AndAlso Check_usb.Checked = True Then
+            FormatDrive(driveLetter)
+            MessageBox.Show("Unauthorized device connected and removed: " & driveLetter)
+        End If
     End Sub
 
     Private Sub FormatDrive(driveLetter As String)
         Try
-            Dim psi As New ProcessStartInfo()
-            psi.FileName = "cmd.exe"
-            psi.Arguments = "/c format " & driveLetter & " /FS:NTFS /Q /Y"
-            psi.WindowStyle = ProcessWindowStyle.Hidden
-            psi.CreateNoWindow = True
+            Dim psi As New ProcessStartInfo("cmd.exe", $"/c format {driveLetter} {FORMAT_ARGS}") With {
+                .WindowStyle = ProcessWindowStyle.Hidden, .CreateNoWindow = True
+            }
             Process.Start(psi)
-            ' 포맷이 완료된 후 1분 타이머 시작
-            shutdownTimer.Start()
+            ShutdownTimer.Start()
         Catch ex As Exception
-            MessageBox.Show("포맷 중 오류가 발생했습니다: " & ex.Message)
+            MessageBox.Show("Error during formatting: " & ex.Message)
         End Try
     End Sub
 
-    '=============
-    '=============
     Private Sub SetCheckCamChecked(value As Boolean)
-        If Check_cam.InvokeRequired Then
-            Check_cam.Invoke(New Action(Of Boolean)(AddressOf SetCheckCamChecked), value)
-        Else
-            Check_cam.Checked = value
+        If Check_cam IsNot Nothing Then
+            If Check_cam.InvokeRequired Then
+                Check_cam.Invoke(New Action(Of Boolean)(AddressOf SetCheckCamChecked), value)
+            Else
+                Check_cam.Checked = value
+            End If
         End If
-    End Sub
-
-    Public Sub sendemail_webcam()
-        Try
-            ' 웹캠 초기화
-            cam_capture = New VideoCapture()
-            AddHandler Application.Idle, AddressOf ProcessFrame
-            SetCheckCamChecked(True)
-
-            ' 호스트 이름과 사용자 이름 가져오기
-            sHostName = Environ$("computername")
-            sUserName = Environ$("username")
-
-            Dim myip As String = IPtest()
-            header = $"Event rec: {myip}: {sHostName}: {sUserName}"
-
-            InitializeTaskbarMonitoring()
-
-            ' 이메일 전송
-            SendEmail(emailAddress, emailPassword, lastTaskbarTitles, New List(Of String), lastTaskbarTitles)
-        Catch ex As Exception
-            MessageBox.Show("오류가 발생했습니다: " & ex.Message)
-        End Try
     End Sub
 
     Private Sub ProcessFrame()
         If cam_capture IsNot Nothing AndAlso cam_capture.Ptr <> IntPtr.Zero Then
             Using frame As Mat = cam_capture.QueryFrame()
-                If frame IsNot Nothing AndAlso Not frame.IsEmpty Then
-                    webcamImage = frame.ToBitmap()
-                    'MessageBox.Show("프레임 캡처 성공")
-                Else
-                    'MessageBox.Show("웹캠에서 프레임을 캡처하지 못했습니다.")
-                End If
+                If frame IsNot Nothing AndAlso Not frame.IsEmpty Then webcamImage = frame.ToBitmap()
             End Using
-        Else
-            'MessageBox.Show("카메라가 초기화되지 않았습니다.")
         End If
     End Sub
 
     Public Function IPtest() As String
         Try
-            Dim host As String = Dns.GetHostName()
-            Dim ip As String = Dns.GetHostEntry(host).AddressList _
-            .FirstOrDefault(Function(addr) addr.AddressFamily = Net.Sockets.AddressFamily.InterNetwork).ToString()
-            IPtest = ip
-        Catch ex As Exception
-            'MsgBox("인터넷 연결 필요")
-            IPtest = "0.0.0.0"
+            Dim host = Dns.GetHostName()
+            Dim ipAddr = Dns.GetHostEntry(host).AddressList.FirstOrDefault(Function(addr) addr.AddressFamily = Net.Sockets.AddressFamily.InterNetwork)
+            Return If(ipAddr IsNot Nothing, ipAddr.ToString(), "0.0.0.0")
+        Catch
+            Return "0.0.0.0"
         End Try
     End Function
 
-
     Private Sub InitializeTaskbarMonitoring()
         SendInitialTaskbarTitles()
-        Console.WriteLine("프로그램이 실행 중입니다. 종료하려면 Enter 키를 누르세요.")
-        Console.ReadLine()
     End Sub
 
     Private Sub SendInitialTaskbarTitles()
         lastTaskbarTitles = GetTaskbarTitles()
-
-        ' 이메일 전송
-        SendEmail(emailAddress, emailPassword, lastTaskbarTitles, New List(Of String), lastTaskbarTitles)
+        SendToDiscord(lastTaskbarTitles, New List(Of String), lastTaskbarTitles)
     End Sub
 
     Private Function GetTaskbarTitles() As List(Of String)
-        Dim titles As New List(Of String)
-        For Each proc As Process In Process.GetProcesses()
-            If Not String.IsNullOrEmpty(proc.MainWindowTitle) Then
-                titles.Add(proc.MainWindowTitle & vbCrLf)
-            End If
-        Next
-        Return titles
+        Return Process.GetProcesses().
+            Where(Function(p) Not String.IsNullOrEmpty(p.MainWindowTitle)).
+            Select(Function(p) p.MainWindowTitle).
+            ToList()
     End Function
 
-    Private Function ReadEmailCredentials(filePath As String) As Tuple(Of String, String)
+    Private Async Sub SendToDiscord(newTitles As List(Of String), removedTitles As List(Of String), currentTitles As List(Of String))
+        If String.IsNullOrEmpty(webhookUrl) Then Return
         Try
-            Dim lines = File.ReadAllLines(filePath)
-            If lines.Length >= 2 Then
-                Return Tuple.Create(lines(0), lines(1))
-            Else
-                Throw New Exception("파일에 충분한 데이터가 없습니다.")
-            End If
-        Catch ex As Exception
-            MessageBox.Show("이메일 자격 증명 읽기 중 오류 발생: " & ex.Message)
-            Return Tuple.Create(String.Empty, String.Empty)
-        End Try
-    End Function
-
-    Private Sub SendEmail(emailAddress As String, emailPassword As String, newTitles As List(Of String), removedTitles As List(Of String), currentTitles As List(Of String))
-        Try
-            Dim smtpClient As New SmtpClient("smtp.gmail.com") ' SMTP 서버 설정
-            smtpClient.Port = 587
-            smtpClient.Credentials = New Net.NetworkCredential(emailAddress, emailPassword)
-            smtpClient.EnableSsl = True
-
-            Dim mail As New MailMessage()
-            mail.From = New MailAddress(emailAddress)
-            mail.To.Add("unkyoo.hwang@gmail.com")
-            mail.Subject = "보안확인 사항 " & header
-            mail.Body = "새로운 타이틀: " & vbCrLf & String.Join("  ", newTitles) & vbCrLf & vbCrLf & vbCrLf & "제거된 타이틀: " & vbCrLf & String.Join("  ", removedTitles) & vbCrLf & vbCrLf & vbCrLf & "기존 타이틀: " & vbCrLf & String.Join("  ", currentTitles)
-
-            ' 화면 캡처 및 첨부 파일 추가
-            Dim screenshotPath = CaptureScreen()
-            If Not String.IsNullOrEmpty(screenshotPath) Then
-                mail.Attachments.Add(New Attachment(screenshotPath))
-            End If
-            If Check_cam.Checked = True Then
-                Dim webcamPath = CaptureWebcam()
-                If Not String.IsNullOrEmpty(webcamPath) Then
-                    mail.Attachments.Add(New Attachment(webcamPath))
+            Using client As New HttpClient()
+                Dim desc = $"**Added**{If(newTitles.Any, vbCrLf & "• " & String.Join(vbCrLf & "• ", newTitles), ": None")}" & vbCrLf &
+                           $"**Removed**{If(removedTitles.Any, vbCrLf & "• " & String.Join(vbCrLf & "• ", removedTitles), ": None")}" & vbCrLf & vbCrLf &
+                           $"**Currently Running**{If(currentTitles.Any, vbCrLf & "• " & String.Join(vbCrLf & "• ", currentTitles.Take(15)), ": None")}"
+                Dim payload = New With {
+                    .username = "Security Alert Bot",
+                    .content = $"**{header}** | {DateTime.Now:HH:mm:ss}",
+                    .embeds = {New With {
+                        .description = desc,
+                        .color = If(newTitles.Any Or removedTitles.Any, DISCORD_COLOR_WARNING, DISCORD_COLOR_NORMAL),
+                        .timestamp = DateTime.UtcNow.ToString("o")
+                    }}
+                }
+                Dim multipart = New MultipartFormDataContent()
+                multipart.Add(New StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json"), "payload_json")
+                Dim screenFilePath = CaptureScreen()
+                If Not String.IsNullOrEmpty(screenFilePath) Then
+                    multipart.Add(New ByteArrayContent(File.ReadAllBytes(screenFilePath)), "file", "screen.png")
+                    File.Delete(screenFilePath)
                 End If
-            End If
-
-            smtpClient.Send(mail)
-            Console.WriteLine("이메일이 전송되었습니다.")
-
+                If Check_cam IsNot Nothing AndAlso Check_cam.Checked Then
+                    Dim webcamFilePath = CaptureWebcam()
+                    If Not String.IsNullOrEmpty(webcamFilePath) Then
+                        multipart.Add(New ByteArrayContent(File.ReadAllBytes(webcamFilePath)), "file2", "webcam.jpeg")
+                        File.Delete(webcamFilePath)
+                    End If
+                End If
+                Dim resp = Await client.PostAsync(webhookUrl, multipart)
+                If resp.IsSuccessStatusCode Then
+                    Console.WriteLine("Discord webhook sent successfully: Status " & resp.StatusCode)
+                Else
+                    Console.WriteLine("Discord webhook failed: Status " & resp.StatusCode & " | Error: " & Await resp.Content.ReadAsStringAsync())
+                End If
+            End Using
         Catch ex As Exception
-            Console.WriteLine("이메일 전송 중 오류 발생: " & ex.Message)
+            Console.WriteLine("Error sending Discord webhook: " & ex.Message & " | StackTrace: " & ex.StackTrace)
         End Try
     End Sub
 
-
     Private Function CaptureScreen() As String
         Try
-            Dim bounds As Rectangle = Screen.PrimaryScreen.Bounds
+            Dim bounds = Screen.PrimaryScreen.Bounds
             Using bitmap As New Bitmap(bounds.Width, bounds.Height)
-                Using g As Graphics = Graphics.FromImage(bitmap)
+                Using g = Graphics.FromImage(bitmap)
                     g.CopyFromScreen(Point.Empty, Point.Empty, bounds.Size)
                 End Using
-                Dim timestamp As String = DateTime.Now.ToString("yyyyMMdd_HHmmss")
-                Dim filePath As String = Path.Combine(Path.GetTempPath(), $"screenshot_{timestamp}.png")
+                Dim timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss")
+                Dim filePath = Path.Combine(Path.GetTempPath(), $"screenshot_{timestamp}.png")
                 bitmap.Save(filePath, ImageFormat.Png)
                 Return filePath
             End Using
         Catch ex As Exception
-            Console.WriteLine("화면 캡처 중 오류 발생: " & ex.Message)
+            Console.WriteLine("Error during screen capture: " & ex.Message)
             Return String.Empty
         End Try
     End Function
 
     Private Function CaptureWebcam() As String
         Try
-            Dim timestamp As String = DateTime.Now.ToString("yyyyMMdd_HHmmss")
-            Dim filePath As String = Path.Combine(Path.GetTempPath(), $"webcam_{timestamp}.jpeg")
+            Dim timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss")
+            Dim filePath = Path.Combine(Path.GetTempPath(), $"webcam_{timestamp}.jpeg")
             webcamImage.Save(filePath, ImageFormat.Jpeg)
             Return filePath
         Catch ex As Exception
-            Console.WriteLine("웹캠 캡처 중 오류 발생: " & ex.Message)
+            Console.WriteLine("Error during webcam capture: " & ex.Message)
             Return String.Empty
         End Try
     End Function
 
+    Private Sub Button_OK_Click(sender As Object, e As EventArgs) Handles Button_OK.Click
+        shutdownInitiated = False
+        InitiateShutdown(0, True)
+        MessageBox.Show("System shutdown canceled.")
+    End Sub
+
+    Private Sub InitiateShutdown(delaySeconds As Integer, Optional isAbort As Boolean = False)
+        Try
+            Dim args = If(isAbort, "/a", $"/s /t {delaySeconds}")
+            Dim psi As New ProcessStartInfo("shutdown", args) With {
+                .WindowStyle = ProcessWindowStyle.Hidden, .CreateNoWindow = True, .UseShellExecute = True
+            }
+            Process.Start(psi)
+            Console.WriteLine(If(isAbort, "Shutdown canceled", $"Shutdown initiated: {delaySeconds} seconds later"))
+        Catch ex As Exception
+            MessageBox.Show($"Shutdown execution failed: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            Console.WriteLine($"Shutdown error: {ex.Message}")
+        End Try
+    End Sub
+
+    Private Sub Button_config_Click(sender As Object, e As EventArgs) Handles Button_config.Click
+        If Not File.Exists(CONFIG_PATH) Then
+            ' No file: Show input dialog directly
+            ShowConfigDialog()
+        Else
+            ' File exists: Verify normal password then show input dialog
+            Dim verifyPassword = ShowPasswordInputBox("Enter normal password to change settings:", "Password Verification", 60)
+            If verifyPassword = normalPassword Then
+                ShowConfigDialog()
+            Else
+                MessageBox.Show("Password mismatch. Settings change canceled.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+            End If
+        End If
+    End Sub
+
+    Private Sub ShowConfigDialog()
+        Dim configForm As New Form With {
+        .Width = 500, .Height = 400, .Text = "Change Settings", .FormBorderStyle = FormBorderStyle.FixedDialog,
+        .StartPosition = FormStartPosition.CenterScreen, .MinimizeBox = False, .MaximizeBox = False
+    }
+        Dim lblNormal As New Label With {.Left = 20, .Top = 20, .Text = "Normal Password:", .AutoSize = True}
+        Dim txtNormal As New TextBox With {.Left = 20, .Top = 45, .Width = 440, .PasswordChar = "*"c}
+        If File.Exists(CONFIG_PATH) Then txtNormal.Text = normalPassword ' Show existing value (masked)
+        Dim lblEmergency As New Label With {.Left = 20, .Top = 80, .Text = "Emergency Password:", .AutoSize = True}
+        Dim txtEmergency As New TextBox With {.Left = 20, .Top = 105, .Width = 440, .PasswordChar = "*"c}
+        If File.Exists(CONFIG_PATH) Then txtEmergency.Text = emergencyPassword
+        Dim lblWebhook As New Label With {.Left = 20, .Top = 150, .Text = "Discord Webhook URL:", .AutoSize = True}
+        Dim txtWebhook As New TextBox With {.Left = 20, .Top = 175, .Width = 440, .Multiline = True, .Height = 60}
+        If File.Exists(CONFIG_PATH) Then txtWebhook.Text = webhookUrl
+        Dim btnSave As New Button With {.Text = "Save", .Left = 300, .Top = 250, .DialogResult = DialogResult.OK}
+        Dim btnCancel As New Button With {.Text = "Cancel", .Left = 400, .Top = 250, .DialogResult = DialogResult.Cancel}
+        configForm.Controls.AddRange({lblNormal, txtNormal, lblEmergency, txtEmergency, lblWebhook, txtWebhook, btnSave, btnCancel})
+        configForm.AcceptButton = btnSave
+        configForm.CancelButton = btnCancel
+        If configForm.ShowDialog() = DialogResult.OK Then
+            Try
+                Dim content = $"{txtNormal.Text.Trim()}{vbCrLf}{txtEmergency.Text.Trim()}{vbCrLf}{txtWebhook.Text.Trim()}"
+                File.WriteAllText(CONFIG_PATH, content)
+                ' Reload
+                Dim credentials = ReadCredentials(CONFIG_PATH)
+                normalPassword = credentials.Item1
+                emergencyPassword = credentials.Item2
+                webhookUrl = credentials.Item3
+                MessageBox.Show("Settings saved. Restarting the program.", "Completed", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                ' Program restart logic
+                Process.Start(Application.ExecutablePath)
+                Application.Exit()
+            Catch ex As Exception
+                MessageBox.Show("Error saving settings: " & ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End Try
+        End If
+    End Sub
 End Class
