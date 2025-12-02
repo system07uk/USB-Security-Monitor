@@ -97,7 +97,7 @@ Partial Class Form1
         ShowIcon = False
         ShowInTaskbar = False
         StartPosition = FormStartPosition.CenterScreen
-        Text = "chk USB"
+        Text = "USB-Security-Monitor"
         ResumeLayout(False)
         PerformLayout()
     End Sub
