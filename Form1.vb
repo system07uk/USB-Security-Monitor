@@ -105,6 +105,7 @@ Public Class Form1
             Dim lines = File.ReadAllLines(filePath)
             If lines.Length >= 3 Then
                 Return Tuple.Create(lines(0), lines(1), lines(2))
+
             Else
                 Throw New Exception("Insufficient data in file.")
             End If
